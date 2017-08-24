@@ -2754,11 +2754,11 @@ namespace FourSlash {
             }
         }
 
-        private getSelection() {
-            return ({
+        private getSelection(): ts.TextRange {
+            return {
                 pos: this.currentCaretPosition,
                 end: this.selectionEnd === -1 ? this.currentCaretPosition : this.selectionEnd
-            });
+            };
         }
 
         public verifyRefactorAvailable(negative: boolean, name?: string, subName?: string) {
@@ -2769,6 +2769,7 @@ namespace FourSlash {
                 refactors = refactors.filter(r => r.name === name && (subName === undefined || r.actions.some(a => a.name === subName)));
             }
             const isAvailable = refactors.length > 0;
+            refactors[0].actions
 
             if (negative && isAvailable) {
                 this.raiseError(`verifyApplicableRefactorAvailableForRange failed - expected no refactor but found some: ${refactors.map(r => r.name).join(", ")}`);
@@ -2794,7 +2795,7 @@ namespace FourSlash {
             }
         }
 
-        public applyRefactor(refactorName: string, actionName: string) {
+        public applyRefactor(refactorName: string, actionName: string, newContentWithRenameMarker: string) {
             const range = this.getSelection();
             const refactors = this.languageService.getApplicableRefactors(this.activeFile.fileName, range);
             const refactor = ts.find(refactors, r => r.name === refactorName);
@@ -2803,9 +2804,39 @@ namespace FourSlash {
             }
 
             const editInfo = this.languageService.getEditsForRefactor(this.activeFile.fileName, this.formatCodeSettings, range, refactorName, actionName);
+            editInfo.renameFilename;
+            editInfo.renameLocation;
             for (const edit of editInfo.edits) {
                 this.applyEdits(edit.fileName, edit.textChanges, /*isFormattingEdit*/ false);
             }
+
+            const { renamePosition, newContent } = parseNewContent();
+
+            this.verifyCurrentFileContent(newContent);
+
+            //TODO: test rename filename
+            if (renamePosition !== editInfo.renameLocation) {
+                this.raiseError(`Expected rename position of ${renameMarker.position}, but got ${editInfo.renameLocation}`);
+            }
+
+
+            /*const renameMarker = this.getMarkerByName(renameMarkerName);
+            if (renameMarker.fileName !== editInfo.renameFilename) {
+                this.raiseError(`Expected rename filename of ${renameMarker.fileName}, but got ${editInfo.renameFilename}`);
+            }
+            if (renameMarker.position !== editInfo.renameLocation) {
+                this.raiseError(`Expected rename position of ${renameMarker.position}, but got ${editInfo.renameLocation}`);
+            }*/
+
+            function parseNewContent() {
+                const renamePosition = newContentWithRenameMarker.indexOf("/*RENAME*/");
+                if (renamePosition !== 0) {
+                    throw new Error("New content should contain /*RENAME*/ marker");
+                }
+                const newContent = newContentWithRenameMarker.slice(0, renamePosition) + newContentWithRenameMarker.slice(renamePosition + "/*RENAME*/".length);
+                return { renamePosition, newContent };
+            }
+
         }
 
         public verifyFileAfterApplyingRefactorAtMarker(

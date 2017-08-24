@@ -14,8 +14,7 @@
 
 goTo.select('start', 'end')
 verify.refactorAvailable('Extract Method');
-edit.applyRefactor('Extract Method', "scope_0");
-verify.currentFileContentIs(
+edit.applyRefactor('Extract Method', "scope_0",
 `class Foo {
     someMethod(m: number) {
         this.newFunction(m);
@@ -23,7 +22,7 @@ verify.currentFileContentIs(
         return q;
     }
 
-    private newFunction(m: number) {
+    private /*RENAME*/newFunction(m: number) {
         var x = m;
         x = x * 3;
         var y = 30;
