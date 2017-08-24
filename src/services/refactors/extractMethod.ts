@@ -31,16 +31,16 @@ namespace ts.refactor.extractMethod {
         const usedNames: Map<boolean> = createMap();
 
         let i = 0;
-        for (const extr of extractions) {
+        for (const { scopeDescription, errors } of extractions) {
             // Skip these since we don't have a way to report errors yet
-            if (extr.errors && extr.errors.length) {
+            if (errors && errors.length) {
                 continue;
             }
 
             // Don't issue refactorings with duplicated names.
             // Scopes come back in "innermost first" order, so extractions will
             // preferentially go into nearer scopes
-            const description = formatStringFromArgs(Diagnostics.Extract_function_into_0.message, [extr.scopeDescription]);
+            const description = formatStringFromArgs(Diagnostics.Extract_function_into_0.message, [scopeDescription]);
             if (!usedNames.has(description)) {
                 usedNames.set(description, true);
                 actions.push({
@@ -75,10 +75,12 @@ namespace ts.refactor.extractMethod {
         const index = +parsedIndexMatch[1];
         Debug.assert(isFinite(index), "Expected to parse a finite number from the scope index");
 
-        const extractions = getPossibleExtractions(targetRange, context, index);
-        // Scope is no longer valid from when the user issued the refactor (??)
-        Debug.assert(extractions !== undefined, "The extraction went missing? How?");
-        return ({ edits: extractions[0].changes });
+        const edits = getPossibleExtractionAtIndex(targetRange, context, index);
+        return {
+            edits,
+            renameFilename: undefined, //TODO!
+            renameLocation: undefined, //TODO!
+        };
     }
 
     // Move these into diagnostic messages if they become user-facing
@@ -102,7 +104,7 @@ namespace ts.refactor.extractMethod {
         export const CannotExtractAmbientBlock = createMessage("Cannot extract code from ambient contexts");
     }
 
-    export enum RangeFacts {
+    enum RangeFacts {
         None = 0,
         HasReturn = 1 << 0,
         IsGenerator = 1 << 1,
@@ -117,7 +119,7 @@ namespace ts.refactor.extractMethod {
     /**
      * Represents an expression or a list of statements that should be extracted with some extra information
      */
-    export interface TargetRange {
+    interface TargetRange {
         readonly range: Expression | Statement[];
         readonly facts: RangeFacts;
         /**
@@ -130,7 +132,7 @@ namespace ts.refactor.extractMethod {
     /**
      * Result of 'getRangeToExtract' operation: contains either a range or a list of errors
      */
-    export type RangeToExtract = {
+    type RangeToExtract = {
         readonly targetRange?: never;
         readonly errors: ReadonlyArray<Diagnostic>;
     } | {
@@ -141,18 +143,7 @@ namespace ts.refactor.extractMethod {
     /*
      * Scopes that can store newly extracted method
      */
-    export type Scope = FunctionLikeDeclaration | SourceFile | ModuleBlock | ClassLikeDeclaration;
-
-    /**
-     * Result of 'extractRange' operation for a specific scope.
-     * Stores either a list of changes that should be applied to extract a range or a list of errors
-     */
-    export interface ExtractResultForScope {
-        readonly scope: Scope;
-        readonly scopeDescription: string;
-        readonly changes?: FileTextChanges[];
-        readonly errors?: Diagnostic[];
-    }
+    type Scope = FunctionLikeDeclaration | SourceFile | ModuleBlock | ClassLikeDeclaration;
 
     /**
      * getRangeToExtract takes a span inside a text file and returns either an expression or an array
@@ -160,7 +151,7 @@ namespace ts.refactor.extractMethod {
      * process may fail, in which case a set of errors is returned instead (these are currently
      * not shown to the user, but can be used by us diagnostically)
      */
-    export function getRangeToExtract(sourceFile: SourceFile, span: TextSpan): RangeToExtract {
+    function getRangeToExtract(sourceFile: SourceFile, span: TextSpan): RangeToExtract {
         const length = span.length || 0;
         // Walk up starting from the the start position until we find a non-SourceFile node that subsumes the selected span.
         // This may fail (e.g. you select two statements in the root of a source file)
@@ -469,7 +460,7 @@ namespace ts.refactor.extractMethod {
      * you may be able to extract into a class method *or* local closure *or* namespace function,
      * depending on what's in the extracted body.
      */
-    export function collectEnclosingScopes(range: TargetRange): Scope[] | undefined {
+    function collectEnclosingScopes(range: TargetRange): Scope[] | undefined {
         let current: Node = isReadonlyArray(range.range) ? firstOrUndefined(range.range) : range.range;
         if (range.facts & RangeFacts.UsesThis) {
             // if range uses this as keyword or as type inside the class then it can only be extracted to a method of the containing class
@@ -505,12 +496,32 @@ namespace ts.refactor.extractMethod {
         return scopes;
     }
 
+    function getPossibleExtractionAtIndex(targetRange: TargetRange, context: RefactorContext, requestedChangesIndex: number): FileTextChanges[] {
+        const { scopes, readsAndWrites: { target, usagesPerScope, errorsPerScope } } = getPossibleExtractionsWorker(targetRange, context);
+        Debug.assert(!errorsPerScope[requestedChangesIndex].length, "The extraction went missing? How?");
+        context.cancellationToken.throwIfCancellationRequested();
+        return extractFunctionInScope(target, scopes[requestedChangesIndex], usagesPerScope[requestedChangesIndex], targetRange, context);
+    }
+
+    interface ExtractResultForScopeA { //nameme
+        readonly scopeDescription: string;
+        readonly errors: Diagnostic[] | undefined;
+    }
     /**
      * Given a piece of text to extract ('targetRange'), computes a list of possible extractions.
      * Each returned ExtractResultForScope corresponds to a possible target scope and is either a set of changes
      * or an error explaining why we can't extract into that scope.
      */
-    export function getPossibleExtractions(targetRange: TargetRange, context: RefactorContext, requestedChangesIndex: number = undefined): ReadonlyArray<ExtractResultForScope> | undefined {
+    function getPossibleExtractions(targetRange: TargetRange, context: RefactorContext): ReadonlyArray<ExtractResultForScopeA> | undefined {
+        const { scopes, readsAndWrites: { errorsPerScope } } = getPossibleExtractionsWorker(targetRange, context);
+        // Need the inner type annotation to avoid https://github.com/Microsoft/TypeScript/issues/7547
+        return scopes.map((scope, i): ExtractResultForScopeA => {
+            const errors = errorsPerScope[i];
+            return { scopeDescription: getDescriptionForScope(scope), errors: errors.length ? errors : undefined }; //TODO: just return errors straight?
+        });
+    }
+
+    function getPossibleExtractionsWorker(targetRange: TargetRange, context: RefactorContext): { readonly scopes: Scope[], readonly readsAndWrites: ReadsAndWrites } {
         const { file: sourceFile } = context;
 
         if (targetRange === undefined) {
@@ -523,34 +534,13 @@ namespace ts.refactor.extractMethod {
         }
 
         const enclosingTextRange = getEnclosingTextRange(targetRange, sourceFile);
-        const { target, usagesPerScope, errorsPerScope } = collectReadsAndWrites(
+        const readsAndWrites = collectReadsAndWrites(
             targetRange,
             scopes,
             enclosingTextRange,
             sourceFile,
             context.program.getTypeChecker());
-
-        context.cancellationToken.throwIfCancellationRequested();
-
-        if (requestedChangesIndex !== undefined) {
-            if (errorsPerScope[requestedChangesIndex].length) {
-                return undefined;
-            }
-            return [extractFunctionInScope(target, scopes[requestedChangesIndex], usagesPerScope[requestedChangesIndex], targetRange, context)];
-        }
-        else {
-            return scopes.map((scope, i) => {
-                const errors = errorsPerScope[i];
-                if (errors.length) {
-                    return {
-                        scope,
-                        scopeDescription: getDescriptionForScope(scope),
-                        errors
-                    };
-                }
-                return { scope, scopeDescription: getDescriptionForScope(scope) };
-            });
-        }
+        return { scopes, readsAndWrites };
     }
 
     function getDescriptionForScope(scope: Scope) {
@@ -604,12 +594,16 @@ namespace ts.refactor.extractMethod {
         return functionNameText;
     }
 
-    export function extractFunctionInScope(
+    /**
+     * Result of 'extractRange' operation for a specific scope.
+     * Stores either a list of changes that should be applied to extract a range or a list of errors
+     */
+    function extractFunctionInScope(
         node: Statement | Expression | Block,
         scope: Scope,
         { usages: usagesInScope, substitutions }: ScopeUsages,
         range: TargetRange,
-        context: RefactorContext): ExtractResultForScope {
+        context: RefactorContext): FileTextChanges[] {
 
         const checker = context.program.getTypeChecker();
 
@@ -765,11 +759,7 @@ namespace ts.refactor.extractMethod {
             changeTracker.replaceNodeWithNodes(context.file, range.range, newNodes, { nodeSeparator: context.newLineCharacter });
         }
 
-        return {
-            scope,
-            scopeDescription: getDescriptionForScope(scope),
-            changes: changeTracker.getChanges()
-        };
+        return changeTracker.getChanges();
 
         function getPropertyAssignmentsForWrites(writes: UsageEntry[]) {
             return writes.map(w => createShorthandPropertyAssignment(w.symbol.name));
@@ -856,23 +846,28 @@ namespace ts.refactor.extractMethod {
         Write = 2
     }
 
-    export interface UsageEntry {
+    interface UsageEntry {
         readonly usage: Usage;
         readonly symbol: Symbol;
         readonly node: Node;
     }
 
-    export interface ScopeUsages {
+    interface ScopeUsages {
         usages: Map<UsageEntry>;
         substitutions: Map<Node>;
     }
 
+    interface ReadsAndWrites {
+        readonly target: Expression | Block;
+        readonly usagesPerScope: ReadonlyArray<ScopeUsages>;
+        readonly errorsPerScope: ReadonlyArray<Diagnostic[]>;
+    }
     function collectReadsAndWrites(
         targetRange: TargetRange,
         scopes: Scope[],
         enclosingTextRange: TextRange,
         sourceFile: SourceFile,
-        checker: TypeChecker) {
+        checker: TypeChecker): ReadsAndWrites {
 
         const usagesPerScope: ScopeUsages[] = [];
         const substitutionsPerScope: Map<Node>[] = [];
