@@ -599,11 +599,12 @@ namespace ts.refactor.extractMethod {
      * Stores either a list of changes that should be applied to extract a range or a list of errors
      */
     function extractFunctionInScope(
+        //what node is this?
         node: Statement | Expression | Block,
         scope: Scope,
         { usages: usagesInScope, substitutions }: ScopeUsages,
         range: TargetRange,
-        context: RefactorContext): FileTextChanges[] {
+        context: RefactorContext): { renameFilename: string, renameLocation: number, changes: FileTextChanges[] } {
 
         const checker = context.program.getTypeChecker();
 
@@ -612,8 +613,8 @@ namespace ts.refactor.extractMethod {
         const functionNameText: string = getUniqueName(n => !file.identifiers.has(n));
         const isJS = isInJavaScriptFile(scope);
 
-        const functionName = createIdentifier(functionNameText as string);
-        const functionReference = createIdentifier(functionNameText as string);
+        const functionName = createIdentifier(functionNameText);
+        const functionReference = createIdentifier(functionNameText);
 
         let returnType: TypeNode = undefined;
         const parameters: ParameterDeclaration[] = [];
@@ -650,7 +651,7 @@ namespace ts.refactor.extractMethod {
             returnType = checker.typeToTypeNode(contextualType);
         }
 
-        const { body, returnValueProperty } = transformFunctionBody(node);
+        const { body, returnValueProperty } = transformFunctionBody(node, writes, substitutions, !!(range.facts & RangeFacts.HasReturn));
         let newFunction: MethodDeclaration | FunctionDeclaration;
 
         if (isClassLike(scope)) {
@@ -759,65 +760,75 @@ namespace ts.refactor.extractMethod {
             changeTracker.replaceNodeWithNodes(context.file, range.range, newNodes, { nodeSeparator: context.newLineCharacter });
         }
 
-        return changeTracker.getChanges();
-
-        function getPropertyAssignmentsForWrites(writes: UsageEntry[]) {
-            return writes.map(w => createShorthandPropertyAssignment(w.symbol.name));
+        const changes = changeTracker.getChanges();
+        if (isReadonlyArray(range.range)) {
+            return {
+                renameFilename: range.range[0].getSourceFile().fileName,
+                renameLocation: range.range[0].getStart(),
+                changes,
+            }
         }
-
-        function generateReturnValueProperty() {
-            return "__return";
+        else {
+            return {
+                renameFilename: range.range.getSourceFile().fileName,
+                renameLocation: range.range.getStart(),
+                changes,
+            };
         }
+    }
 
-        function transformFunctionBody(body: Node) {
-            if (isBlock(body) && !writes && substitutions.size === 0) {
-                // already block, no writes to propagate back, no substitutions - can use node as is
-                return { body: createBlock(body.statements, /*multLine*/ true), returnValueProperty: undefined };
-            }
-            let returnValueProperty: string;
-            const statements = createNodeArray(isBlock(body) ? body.statements.slice(0) : [isStatement(body) ? body : createReturn(<Expression>body)]);
-            // rewrite body if either there are writes that should be propagated back via return statements or there are substitutions
-            if (writes || substitutions.size) {
-                const rewrittenStatements = visitNodes(statements, visitor).slice();
-                if (writes && !(range.facts & RangeFacts.HasReturn) && isStatement(body)) {
-                    // add return at the end to propagate writes back in case if control flow falls out of the function body
-                    // it is ok to know that range has at least one return since it we only allow unconditional returns
-                    const assignments = getPropertyAssignmentsForWrites(writes);
-                    if (assignments.length === 1) {
-                        rewrittenStatements.push(createReturn(assignments[0].name));
-                    }
-                    else {
-                        rewrittenStatements.push(createReturn(createObjectLiteral(assignments)));
-                    }
-                }
-                return { body: createBlock(rewrittenStatements, /*multiLine*/ true), returnValueProperty };
-            }
-            else {
-                return { body: createBlock(statements, /*multiLine*/ true), returnValueProperty: undefined };
-            }
-
-            function visitor(node: Node): VisitResult<Node> {
-                if (node.kind === SyntaxKind.ReturnStatement && writes) {
-                    const assignments: ObjectLiteralElementLike[] = getPropertyAssignmentsForWrites(writes);
-                    if ((<ReturnStatement>node).expression) {
-                        if (!returnValueProperty) {
-                            returnValueProperty = generateReturnValueProperty();
-                        }
-                        assignments.unshift(createPropertyAssignment(returnValueProperty, visitNode((<ReturnStatement>node).expression, visitor)));
-                    }
-                    if (assignments.length === 1) {
-                        return createReturn(assignments[0].name as Expression);
-                    }
-                    else {
-                        return createReturn(createObjectLiteral(assignments));
-                    }
+    function transformFunctionBody(body: Node, writes: ReadonlyArray<UsageEntry>, substitutions: ReadonlyMap<Node>, hasReturn: boolean): { body: Block, returnValueProperty: string } {
+        if (isBlock(body) && !writes && substitutions.size === 0) {
+            // already block, no writes to propagate back, no substitutions - can use node as is
+            return { body: createBlock(body.statements, /*multLine*/ true), returnValueProperty: undefined };
+        }
+        let returnValueProperty: string;
+        const statements = createNodeArray(isBlock(body) ? body.statements.slice(0) : [isStatement(body) ? body : createReturn(<Expression>body)]);
+        // rewrite body if either there are writes that should be propagated back via return statements or there are substitutions
+        if (writes || substitutions.size) {
+            const rewrittenStatements = visitNodes(statements, visitor).slice();
+            if (writes && !hasReturn && isStatement(body)) {
+                // add return at the end to propagate writes back in case if control flow falls out of the function body
+                // it is ok to know that range has at least one return since it we only allow unconditional returns
+                const assignments = getPropertyAssignmentsForWrites(writes);
+                if (assignments.length === 1) {
+                    rewrittenStatements.push(createReturn(assignments[0].name));
                 }
                 else {
-                    const substitution = substitutions.get(getNodeId(node).toString());
-                    return substitution || visitEachChild(node, visitor, nullTransformationContext);
+                    rewrittenStatements.push(createReturn(createObjectLiteral(assignments)));
                 }
             }
+            return { body: createBlock(rewrittenStatements, /*multiLine*/ true), returnValueProperty };
         }
+        else {
+            return { body: createBlock(statements, /*multiLine*/ true), returnValueProperty: undefined };
+        }
+
+        function visitor(node: Node): VisitResult<Node> {
+            if (node.kind === SyntaxKind.ReturnStatement && writes) {
+                const assignments: ObjectLiteralElementLike[] = getPropertyAssignmentsForWrites(writes);
+                if ((<ReturnStatement>node).expression) {
+                    if (!returnValueProperty) {
+                        returnValueProperty = "__return";
+                    }
+                    assignments.unshift(createPropertyAssignment(returnValueProperty, visitNode((<ReturnStatement>node).expression, visitor)));
+                }
+                if (assignments.length === 1) {
+                    return createReturn(assignments[0].name as Expression);
+                }
+                else {
+                    return createReturn(createObjectLiteral(assignments));
+                }
+            }
+            else {
+                const substitution = substitutions.get(getNodeId(node).toString());
+                return substitution || visitEachChild(node, visitor, nullTransformationContext);
+            }
+        }
+    }
+
+    function getPropertyAssignmentsForWrites(writes: ReadonlyArray<UsageEntry>): ShorthandPropertyAssignment[] {
+        return writes.map(w => createShorthandPropertyAssignment(w.symbol.name));
     }
 
     function isReadonlyArray(v: any): v is ReadonlyArray<any> {
@@ -853,8 +864,8 @@ namespace ts.refactor.extractMethod {
     }
 
     interface ScopeUsages {
-        usages: Map<UsageEntry>;
-        substitutions: Map<Node>;
+        readonly usages: Map<UsageEntry>;
+        readonly substitutions: Map<Node>;
     }
 
     interface ReadsAndWrites {
